@@ -1,0 +1,11 @@
+FROM amazonlinux:2023
+
+# Copy all files
+COPY . /workspace
+WORKDIR /workspace
+
+# Make script executable
+RUN chmod +x scripts/build-amzn2023.sh
+
+# Run the build script
+CMD ["./scripts/build-amzn2023.sh"]

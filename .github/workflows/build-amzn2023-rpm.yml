@@ -1,0 +1,117 @@
+name: Build Knot Resolver Amazon Linux 2023 RPM packages
+
+on:
+  push:
+    branches: [main, master, develop]
+    tags:
+      - "v*"
+  pull_request:
+    branches: [main, master, develop]
+  workflow_dispatch:
+    inputs:
+      knot_resolver_version:
+        description: "Knot Resolver version to build"
+        required: false
+        default: "5.7.6"
+        type: string
+
+jobs:
+  build-rpm:
+    strategy:
+      matrix:
+        include:
+          - runner: [self-hosted, Linux, X64, dmz]
+            arch: x86_64
+          - runner: [self-hosted, Linux, ARM64, dmz]
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build Knot Resolver RPM
+        env:
+          KNOT_RESOLVER_VERSION: ${{ github.event.inputs.knot_resolver_version || '5.7.6' }}
+        run: |
+          docker run --rm -v "$PWD":/workspace -w /workspace amazonlinux:2023 /bin/bash -c "
+            chmod +x scripts/build-amzn2023.sh
+            ./scripts/build-amzn2023.sh
+          "
+
+      - name: List built packages
+        run: |
+          echo "=== All built RPM packages ==="
+          find rpmbuild-output -name "*.rpm" -type f -exec basename {} \;
+          echo ""
+          echo "=== Knot Resolver packages ==="
+          find rpmbuild-output -name "knot-resolver*.rpm" | head -10
+
+      - name: Upload RPM packages to Fury
+        if: success() && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        env:
+          FURY_TOKEN: ${{ secrets.FURY_TOKEN }}
+        run: |
+          if [ -z "$FURY_TOKEN" ]; then
+            echo "FURY_TOKEN is not set. Skipping upload to Fury."
+            exit 0
+          fi
+
+          echo "Uploading RPM packages to Fury..."
+
+          upload_success=0
+          upload_failed=0
+          upload_skipped=0
+
+          # Upload all RPM packages
+          if [ ! -d rpmbuild-output/RPMS ]; then
+            echo "❌ Binary RPM directory not found"
+            exit 1
+          fi
+
+          for rpm_file in $(find rpmbuild-output/RPMS -name "*.rpm" -type f); do
+            echo "Uploading: $rpm_file"
+
+            # Use curl with more verbose error handling
+            response_file=$(mktemp)
+            http_code=$(curl -s -w "%{http_code}" \
+              -F package=@"$rpm_file" \
+              "https://${FURY_TOKEN}@push.fury.io/drakemazzy/?replace=true" \
+              -o "$response_file" \
+              2>/dev/null)
+
+            response_body=$(cat "$response_file")
+            rm -f "$response_file"
+
+            if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
+              echo "✓ Successfully uploaded: $(basename "$rpm_file") (HTTP $http_code)"
+              upload_success=$((upload_success + 1))
+            elif [ "$http_code" = "409" ] && echo "$response_body" | grep -iq "already exists"; then
+              echo "ℹ️  Package already exists on Fury, skipping upload: $(basename "$rpm_file")"
+              upload_skipped=$((upload_skipped + 1))
+            else
+              echo "✗ Failed to upload: $(basename "$rpm_file") (HTTP $http_code)"
+              echo "Response body: $response_body"
+              upload_failed=$((upload_failed + 1))
+              echo "❌ Upload failed; stopping workflow"
+              exit 1
+            fi
+
+            # Add small delay between uploads
+            sleep 5s
+          done
+
+          echo ""
+          echo "Upload summary:"
+          echo "  Successfully uploaded: $upload_success packages"
+          echo "  Failed uploads: $upload_failed packages"
+          echo "  Skipped (already existed): ${upload_skipped:-0} packages"
+
+          if [ $upload_failed -gt 0 ]; then
+            echo "❌ Some packages failed to upload"
+            exit 1
+          else
+            echo "✅ All RPM packages processed successfully!"
+          fi
